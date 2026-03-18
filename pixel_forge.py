@@ -11,15 +11,18 @@ the symmetry axis lands on an integer or half-integer pixel boundary.
 This prevents the grayscale anti-aliasing from rounding differently on
 the two sides, which would produce visibly asymmetric pixel art.
 
+Supports both TrueType (.ttf) and OpenType/CFF (.otf) input fonts.
+
 Dependencies:
     pip install fonttools freetype-py numpy
 
 Usage:
     python pixel_forge.py fonts/original.ttf
+    python pixel_forge.py fonts/original.otf
     python pixel_forge.py --grid 16 fonts/original.ttf
-    python pixel_forge.py --grid 20 --output fonts/ fonts/original.ttf
+    python pixel_forge.py --grid 20 --output fonts/ fonts/original.otf
 
-Output filename: <input_stem>_<grid>.ttf  (in same dir as input by default)
+Output filename: <input_stem>_<grid>.ttf/.otf  (in same dir as input by default)
 """
 
 import argparse
@@ -41,7 +44,7 @@ def parse_args():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("input", help="Input TTF file (e.g. fonts/original.ttf)")
+    ap.add_argument("input", help="Input TTF or OTF file (e.g. fonts/original.ttf or fonts/original.otf)")
     ap.add_argument(
         "--grid", "-g", type=int, default=16,
         help="Pixel grid height in pixels (default: 16)",
@@ -61,6 +64,27 @@ def parse_args():
         help="Print on-curve points and mirror-hit details for the named glyph, then exit.",
     )
     return ap.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Glyph bounding-box helper (works for both TTF and OTF/CFF)
+# ---------------------------------------------------------------------------
+
+def _get_glyph_bounds(font, glyph_name: str):
+    """
+    Return (xMin, yMin, xMax, yMax) in font units, or None if unavailable.
+    Uses BoundsPen so it works for both TrueType (glyf) and CFF outlines.
+    """
+    from fontTools.pens.boundsPen import BoundsPen
+    glyph_set = font.getGlyphSet()
+    if glyph_name not in glyph_set:
+        return None
+    bp = BoundsPen(glyph_set)
+    try:
+        glyph_set[glyph_name].draw(bp)
+    except Exception:
+        return None
+    return bp.bounds  # (xMin, yMin, xMax, yMax) or None for empty glyph
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +572,6 @@ def draw_contours(contours: list, pen) -> None:
 
 def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 96) -> None:
     from fontTools.ttLib import TTFont
-    from fontTools.pens.ttGlyphPen import TTGlyphPen
 
     print(f"Loading  {input_path}")
     font = TTFont(input_path)
@@ -560,7 +583,14 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
     upm   = font["head"].unitsPerEm    # 1024
     scale = upm / grid_size            # font-units per pixel  (e.g. 64 at grid=16)
 
-    glyf  = font["glyf"]
+    is_otf = "CFF " in font or "CFF2" in font
+    if is_otf:
+        from fontTools.pens.t2Pen import T2Pen
+        cff_charstrings = font["CFF "].cff.topDictIndex[0].CharStrings
+    else:
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+        glyf = font["glyf"]
+
     hmtx  = font["hmtx"].metrics
 
     face  = load_face(input_path, grid_size)
@@ -583,13 +613,11 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
         lr_symmetries[glyph_name] = lr
         tb_symmetries[glyph_name] = tb
 
-        # Get bounding box from the glyf table (xMin/xMax are stored there)
-        try:
-            g = font["glyf"][glyph_name]
-            g.recalcBounds(font["glyf"])
-            xMin, yMin, xMax, yMax = g.xMin, g.yMin, g.xMax, g.yMax
-        except Exception:
+        # Get bounding box (works for both TTF glyf and OTF/CFF outlines)
+        bounds = _get_glyph_bounds(font, glyph_name)
+        if bounds is None:
             continue
+        xMin, yMin, xMax, yMax = bounds
 
         # For non-LR-symmetric glyphs use the bbox midpoint as the centering
         # target (same maths as alignment_shift_26dot6, just a different cx).
@@ -651,15 +679,24 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
         orig_adv, _orig_lsb = hmtx.get(glyph_name, (upm, 0))
         snapped_adv = int(round(orig_adv / scale) * scale)
 
-        pen = TTGlyphPen(None)
-        draw_contours(scaled, pen)
-
-        try:
-            glyf[glyph_name] = pen.glyph()
-        except Exception as e:
-            print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (glyph build error: {e})")
-            skipped.append(glyph_name)
-            continue
+        if is_otf:
+            try:
+                pen = T2Pen(snapped_adv, cff_charstrings)
+                draw_contours(scaled, pen)
+                cff_charstrings[glyph_name] = pen.charString
+            except Exception as e:
+                print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (glyph build error: {e})")
+                skipped.append(glyph_name)
+                continue
+        else:
+            pen = TTGlyphPen(None)
+            draw_contours(scaled, pen)
+            try:
+                glyf[glyph_name] = pen.glyph()
+            except Exception as e:
+                print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (glyph build error: {e})")
+                skipped.append(glyph_name)
+                continue
 
         hmtx[glyph_name] = (snapped_adv, int(round(bm_left * scale)))
 
@@ -747,13 +784,11 @@ def _debug_glyph(font_path: str, glyph_name: str,
     print(f"LR score  : {lr_hits}/{n} = {lr_hits/n:.3f}")
     print(f"TB score  : {tb_hits}/{n} = {tb_hits/n:.3f}")
 
-    try:
-        g = font["glyf"][glyph_name]
-        g.recalcBounds(font["glyf"])
-        print(f"glyf bbox : xMin={g.xMin} xMax={g.xMax} yMin={g.yMin} yMax={g.yMax}")
-        print(f"bbox cx   : {(g.xMin+g.xMax)/2:.1f}  (vs on-curve cx={cx:.1f})")
-    except Exception:
-        pass
+    bounds = _get_glyph_bounds(font, glyph_name)
+    if bounds is not None:
+        bxMin, byMin, bxMax, byMax = bounds
+        print(f"bbox      : xMin={bxMin:.0f} xMax={bxMax:.0f} yMin={byMin:.0f} yMax={byMax:.0f}")
+        print(f"bbox cx   : {(bxMin+bxMax)/2:.1f}  (vs on-curve cx={cx:.1f})")
 
     # ---- Bitmap visualisation -----------------------------------------------
     cmap_fwd = font.getBestCmap() or {}
@@ -761,20 +796,15 @@ def _debug_glyph(font_path: str, glyph_name: str,
     if cp_code is None:
         return
 
-    from fontTools.ttLib import TTFont as _TTFont
     face = load_face(font_path, 16)   # use grid=16 for debug
     scale = font["head"].unitsPerEm / 16
 
     lr, tb, cx2, cy2, _, _ = detect_symmetry(font, glyph_name)
 
-    try:
-        g2 = font["glyf"][glyph_name]
-        g2.recalcBounds(font["glyf"])
-        xMin2 = g2.xMin
-        yMin2 = g2.yMin
-        xMax2 = g2.xMax
-        yMax2 = g2.yMax
-    except Exception:
+    bounds2 = _get_glyph_bounds(font, glyph_name)
+    if bounds2 is not None:
+        xMin2, yMin2, xMax2, yMax2 = bounds2
+    else:
         xMin2 = xMax2 = yMin2 = yMax2 = 0
 
     if not lr:
@@ -843,9 +873,9 @@ def main():
     if args.output:
         out = Path(args.output)
         if out.is_dir():
-            out = out / f"{inp.stem}_{args.grid}.ttf"
+            out = out / f"{inp.stem}_{args.grid}{inp.suffix}"
     else:
-        out = inp.parent / f"{inp.stem}_{args.grid}.ttf"
+        out = inp.parent / f"{inp.stem}_{args.grid}{inp.suffix}"
 
     print(f"Input     : {inp}")
     print(f"Grid      : {args.grid}×{args.grid}  (1 pixel = {1024 / args.grid:.1f} font units)")
