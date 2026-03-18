@@ -1,4 +1,4 @@
-# pixel_forge.py
+# PixelForge.py
 
 A Python script that converts a smooth TrueType icon font into a pixel/bitmap style font.
 Each glyph is rasterised onto a fixed pixel grid and re-vectorised as a rectilinear (all right-angle, no curves) outline.

@@ -419,6 +419,28 @@ def enforce_lr_symmetry(grid: np.ndarray, axis: float = None, score_threshold: f
             return grid
         axis = best_axis
 
+    # Verify the bitmap is actually close to symmetric before enforcing.
+    # For each non-empty row, compute the fraction of filled pixels that already
+    # have their mirror filled.  If too many rows are significantly asymmetric
+    # the glyph has intentional asymmetry (e.g. a chat-bubble tail) and should
+    # not be enforced.
+    good_rows = 0
+    total_rows = 0
+    for r in range(rows):
+        filled = np.where(grid[r])[0]
+        if len(filled) == 0:
+            continue
+        total_rows += 1
+        hits = sum(
+            1 for c in filled
+            if 0 <= int(round(2 * axis - c)) < cols
+            and grid[r, int(round(2 * axis - c))]
+        )
+        if hits / len(filled) >= 0.85:
+            good_rows += 1
+    if total_rows > 0 and good_rows / total_rows < 0.90:
+        return grid
+
     new_grid = grid.copy()
     for r in range(rows):
         for c in range(cols):
@@ -466,6 +488,24 @@ def enforce_tb_symmetry(grid: np.ndarray, axis: float = None, score_threshold: f
         if best_count / len(centers) < score_threshold:
             return grid
         axis = best_axis
+
+    # Verify the bitmap is actually close to symmetric before enforcing.
+    good_cols = 0
+    total_cols = 0
+    for c in range(cols):
+        filled = np.where(grid[:, c])[0]
+        if len(filled) == 0:
+            continue
+        total_cols += 1
+        hits = sum(
+            1 for r in filled
+            if 0 <= int(round(2 * axis - r)) < rows
+            and grid[int(round(2 * axis - r)), c]
+        )
+        if hits / len(filled) >= 0.85:
+            good_cols += 1
+    if total_cols > 0 and good_cols / total_cols < 0.90:
+        return grid
 
     new_grid = grid.copy()
     for r in range(rows):
