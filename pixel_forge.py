@@ -585,7 +585,7 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
 
     is_otf = "CFF " in font or "CFF2" in font
     if is_otf:
-        from fontTools.pens.t2Pen import T2Pen
+        from fontTools.pens.t2CharStringPen import T2CharStringPen
         cff_charstrings = font["CFF "].cff.topDictIndex[0].CharStrings
     else:
         from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -681,9 +681,12 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
 
         if is_otf:
             try:
-                pen = T2Pen(snapped_adv, cff_charstrings)
+                # Reuse the existing charstring's private dict (handles both
+                # simple and CID-keyed fonts where Private is per-FD).
+                existing_private = getattr(cff_charstrings.get(glyph_name), 'private', None)
+                pen = T2CharStringPen(snapped_adv, None)
                 draw_contours(scaled, pen)
-                cff_charstrings[glyph_name] = pen.charString
+                cff_charstrings[glyph_name] = pen.getCharString(private=existing_private)
             except Exception as e:
                 print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (glyph build error: {e})")
                 skipped.append(glyph_name)
