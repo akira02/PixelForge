@@ -56,6 +56,10 @@ def parse_args():
         help="Grayscale fill threshold 1-255: lower=fatter strokes, higher=thinner "
              "(default: 96)",
     )
+    ap.add_argument(
+        "--debug-glyph", "-d", default=None, metavar="NAME",
+        help="Print on-curve points and mirror-hit details for the named glyph, then exit.",
+    )
     return ap.parse_args()
 
 
@@ -90,23 +94,33 @@ def _on_curve_points(font, glyph_name: str) -> list:
     return [p for p in pts if p is not None]
 
 
-def detect_symmetry(font, glyph_name: str, tolerance: int = 2, score_threshold: float = 0.9):
+def detect_symmetry(font, glyph_name: str,
+                    lr_x_tolerance: int = 32, lr_y_tolerance: int = 32,
+                    tb_x_tolerance: int = 32, tb_y_tolerance: int = 32,
+                    score_threshold: float = 0.75):
     """
     Detect left-right and top-bottom symmetry from on-curve outline points.
 
     For each on-curve point P, checks whether its mirror across the bounding-
-    box centre exists in the outline (within ±tolerance font units).
+    box centre exists in the outline within the given per-axis tolerances.
+
+    Bezier curve outlines place on-curve endpoints at positions that may differ
+    by up to ~20 font units even on geometrically symmetric paths:
+      - LR pairs share the same y-height (y_tol small) but x can drift (x_tol larger)
+      - TB pairs share the same x-column (x_tol small) but y can drift (y_tol larger)
 
     Returns
     -------
-    lr : bool   — glyph is left-right symmetric
-    tb : bool   — glyph is top-bottom symmetric
-    cx : float  — x centre of the LR symmetry axis (font units)
-    cy : float  — y centre of the TB symmetry axis (font units)
+    lr : bool       — glyph is left-right symmetric
+    tb : bool       — glyph is top-bottom symmetric
+    cx : float      — x centre of the LR symmetry axis (font units)
+    cy : float      — y centre of the TB symmetry axis (font units)
+    lr_score : float
+    tb_score : float
     """
     pts = _on_curve_points(font, glyph_name)
     if not pts:
-        return False, False, 0.0, 0.0
+        return False, False, 0.0, 0.0, 0.0, 0.0
 
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
@@ -116,20 +130,30 @@ def detect_symmetry(font, glyph_name: str, tolerance: int = 2, score_threshold: 
     # Build integer-rounded point set for fast lookup
     pt_set = {(round(x), round(y)) for x, y in pts}
 
-    def has_mirror(mx, my):
+    def has_lr_mirror(mx, my):
         return any(
             (mx + dx, my + dy) in pt_set
-            for dx in range(-tolerance, tolerance + 1)
-            for dy in range(-tolerance, tolerance + 1)
+            for dx in range(-lr_x_tolerance, lr_x_tolerance + 1)
+            for dy in range(-lr_y_tolerance, lr_y_tolerance + 1)
         )
 
-    lr_hits = sum(1 for x, y in pts if has_mirror(round(2 * cx - x), round(y)))
-    tb_hits = sum(1 for x, y in pts if has_mirror(round(x), round(2 * cy - y)))
-    n = len(pts)
+    def has_tb_mirror(mx, my):
+        return any(
+            (mx + dx, my + dy) in pt_set
+            for dx in range(-tb_x_tolerance, tb_x_tolerance + 1)
+            for dy in range(-tb_y_tolerance, tb_y_tolerance + 1)
+        )
 
-    return (lr_hits / n >= score_threshold,
-            tb_hits / n >= score_threshold,
-            cx, cy)
+    lr_hits = sum(1 for x, y in pts if has_lr_mirror(round(2 * cx - x), round(y)))
+    tb_hits = sum(1 for x, y in pts if has_tb_mirror(round(x), round(2 * cy - y)))
+    n = len(pts)
+    lr_score = lr_hits / n
+    tb_score = tb_hits / n
+
+    return (lr_score >= score_threshold,
+            tb_score >= score_threshold,
+            cx, cy,
+            lr_score, tb_score)
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +244,12 @@ def _set_ft_transform(face, dx_26dot6: int, dy_26dot6: int = 0) -> None:
     freetype.FT_Set_Transform(face._FT_Face, None, ctypes.byref(vec))
 
 
-def rasterise(face, charcode: int, threshold: int = 96, delta_26dot6: int = 0):
+def rasterise(face, charcode: int, threshold: int = 96, delta_26dot6: int = 0, dy_26dot6: int = 0):
     """
     Render one codepoint at the face's current pixel size using grayscale
     anti-aliasing + threshold.
 
-    If delta_26dot6 != 0, a subpixel horizontal shift is applied before
+    If delta_26dot6 or dy_26dot6 != 0, a subpixel shift is applied before
     rendering (to align the symmetry axis to a pixel boundary) and cleared
     afterwards.
 
@@ -238,14 +262,14 @@ def rasterise(face, charcode: int, threshold: int = 96, delta_26dot6: int = 0):
     """
     import freetype
 
-    if delta_26dot6 != 0:
-        _set_ft_transform(face, delta_26dot6)
+    if delta_26dot6 != 0 or dy_26dot6 != 0:
+        _set_ft_transform(face, delta_26dot6, dy_26dot6)
 
     face.load_char(charcode, freetype.FT_LOAD_DEFAULT | freetype.FT_LOAD_NO_HINTING)
     face.glyph.render(freetype.FT_RENDER_MODE_NORMAL)
 
-    if delta_26dot6 != 0:
-        _set_ft_transform(face, 0)   # reset
+    if delta_26dot6 != 0 or dy_26dot6 != 0:
+        _set_ft_transform(face, 0, 0)   # reset
 
     slot = face.glyph
     bm   = slot.bitmap
@@ -359,45 +383,98 @@ def bitmap_to_contours(grid: np.ndarray) -> list:
 # Post-rasterisation symmetry enforcement
 # ---------------------------------------------------------------------------
 
-def enforce_lr_symmetry(grid: np.ndarray, score_threshold: float = 0.75):
+def enforce_lr_symmetry(grid: np.ndarray, axis: float = None, score_threshold: float = 0.75):
     """
-    If the majority of content rows are already left-right symmetric, OR-fill
-    the remaining asymmetric rows to enforce full symmetry.
+    OR-fill the bitmap to enforce left-right symmetry.
 
-    The mirror axis is detected as the most common snapped row-centre (0.5
-    granularity).  If fewer than `score_threshold` of content rows agree on
-    that axis the grid is returned unchanged.
+    If `axis` (pixel-space column, may be fractional) is provided it is used
+    directly as the mirror axis.  Otherwise the axis is estimated from the
+    bitmap itself (less reliable).  In the fallback case, if fewer than
+    `score_threshold` of content rows agree on the detected axis the grid is
+    returned unchanged.
 
     Returns the (possibly modified) grid.
     """
     from collections import Counter
 
     rows, cols = grid.shape
-    centers = []
-    for r in range(rows):
-        filled = np.where(grid[r])[0]
-        if len(filled) == 0:
-            continue
-        centers.append((int(filled[0]) + int(filled[-1])) / 2.0)
 
-    if not centers:
-        return grid
+    if axis is None:
+        # Fallback: estimate axis from bitmap row centres
+        centers = []
+        for r in range(rows):
+            filled = np.where(grid[r])[0]
+            if len(filled) == 0:
+                continue
+            centers.append((int(filled[0]) + int(filled[-1])) / 2.0)
 
-    snapped = [round(c * 2) / 2 for c in centers]
-    axis_counts = Counter(snapped)
-    best_axis, best_count = axis_counts.most_common(1)[0]
+        if not centers:
+            return grid
 
-    if best_count / len(centers) < score_threshold:
-        return grid
+        snapped = [round(c * 2) / 2 for c in centers]
+        axis_counts = Counter(snapped)
+        best_axis, best_count = axis_counts.most_common(1)[0]
+
+        if best_count / len(centers) < score_threshold:
+            return grid
+        axis = best_axis
 
     new_grid = grid.copy()
     for r in range(rows):
         for c in range(cols):
             if not grid[r, c]:
                 continue
-            mirror_c = int(round(2 * best_axis - c))
+            mirror_c = int(round(2 * axis - c))
             if 0 <= mirror_c < cols:
                 new_grid[r, mirror_c] = True
+
+    return new_grid
+
+
+def enforce_tb_symmetry(grid: np.ndarray, axis: float = None, score_threshold: float = 0.75):
+    """
+    OR-fill the bitmap to enforce top-bottom symmetry.
+
+    If `axis` (pixel-space row, may be fractional) is provided it is used
+    directly as the mirror axis.  Otherwise the axis is estimated from the
+    bitmap itself (less reliable).  In the fallback case, if fewer than
+    `score_threshold` of content columns agree on the detected axis the grid is
+    returned unchanged.
+
+    Returns the (possibly modified) grid.
+    """
+    from collections import Counter
+
+    rows, cols = grid.shape
+
+    if axis is None:
+        # Fallback: estimate axis from bitmap column centres
+        centers = []
+        for c in range(cols):
+            filled = np.where(grid[:, c])[0]
+            if len(filled) == 0:
+                continue
+            centers.append((int(filled[0]) + int(filled[-1])) / 2.0)
+
+        if not centers:
+            return grid
+
+        snapped = [round(c * 2) / 2 for c in centers]
+        axis_counts = Counter(snapped)
+        best_axis, best_count = axis_counts.most_common(1)[0]
+
+        if best_count / len(centers) < score_threshold:
+            return grid
+        axis = best_axis
+
+    new_grid = grid.copy()
+    for r in range(rows):
+        for c in range(cols):
+            if not grid[r, c]:
+                continue
+            mirror_r = int(round(2 * axis - r))
+            if 0 <= mirror_r < rows:
+                new_grid[mirror_r, c] = True
 
     return new_grid
 
@@ -455,10 +532,16 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
     # centre so that the rendered pixels are centred in the advance.
     # ------------------------------------------------------------------
     glyph_set = font.getGlyphSet()
-    shifts = {}   # glyph_name → delta_26dot6
+    shifts = {}        # glyph_name → (dx_26dot6, dy_26dot6)
+    lr_symmetries = {} # glyph_name → bool
+    tb_symmetries = {} # glyph_name → bool
+    cx_axes = {}       # glyph_name → cx in font units (LR symmetry axis)
+    cy_axes = {}       # glyph_name → cy in font units (TB symmetry axis)
 
     for glyph_name in sorted(set(cmap.values())):
-        lr, tb, cx, cy = detect_symmetry(font, glyph_name)
+        lr, tb, cx, cy, lr_score, tb_score = detect_symmetry(font, glyph_name)
+        lr_symmetries[glyph_name] = lr
+        tb_symmetries[glyph_name] = tb
 
         # Get bounding box from the glyf table (xMin/xMax are stored there)
         try:
@@ -472,16 +555,17 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
         # target (same maths as alignment_shift_26dot6, just a different cx).
         if not lr:
             cx = (xMin + xMax) / 2
+        if not tb:
+            cy = (yMin + yMax) / 2
+
+        cx_axes[glyph_name] = cx
+        cy_axes[glyph_name] = cy
 
         dx26 = alignment_shift_26dot6(cx, xMin, scale, threshold)
+        dy26 = alignment_shift_26dot6(cy, yMin, scale, threshold)
 
-        if dx26 != 0:
-            shifts[glyph_name] = dx26
-            delta_px = dx26 / 64
-            print(f"  align  {glyph_name:30s}  lr={lr}  "
-                  f"cx={cx:.1f}fu={cx/scale:.3f}px  shift={delta_px:+.3f}px")
-
-    print()
+        if dx26 != 0 or dy26 != 0:
+            shifts[glyph_name] = (dx26, dy26)
 
     # ------------------------------------------------------------------
     # Rasterise, trace, write glyphs
@@ -492,10 +576,10 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
 
     for cp, glyph_name in sorted(cmap.items()):
         done += 1
-        delta = shifts.get(glyph_name, 0)
+        dx26, dy26 = shifts.get(glyph_name, (0, 0))
 
         try:
-            grid, adv_px, bm_left, bm_top = rasterise(face, cp, threshold, delta)
+            grid, adv_px, bm_left, bm_top = rasterise(face, cp, threshold, dx26, dy26)
         except Exception as e:
             print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (rasterise error: {e})")
             skipped.append(glyph_name)
@@ -505,7 +589,11 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
             print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  blank, keeping original")
             continue
 
-        grid = enforce_lr_symmetry(grid)
+        if lr_symmetries.get(glyph_name, False):
+            grid = enforce_lr_symmetry(grid)
+
+        if tb_symmetries.get(glyph_name, False):
+            grid = enforce_tb_symmetry(grid)
 
         rows = grid.shape[0]
         contours = bitmap_to_contours(grid)
@@ -536,15 +624,170 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
         hmtx[glyph_name] = (snapped_adv, int(round(bm_left * scale)))
 
         n_pts = sum(len(c) for c in scaled)
-        shift_tag = f"  Δx={delta/64:+.3f}px" if delta else ""
+        sym_tag = ("LR" if lr_symmetries.get(glyph_name) else "") + \
+                  ("TB" if tb_symmetries.get(glyph_name) else "")
+        sym_tag = f"  [{sym_tag}]" if sym_tag else ""
+        shift_tag = f"  Δ=({dx26/64:+.3f},{dy26/64:+.3f})px" if (dx26 or dy26) else ""
         print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  "
               f"{grid.shape[1]}×{grid.shape[0]}px  "
-              f"{len(scaled)} contour(s)  {n_pts} pts{shift_tag}")
+              f"{len(scaled)} contour(s)  {n_pts} pts{sym_tag}{shift_tag}")
 
     font.save(output_path)
     print(f"\nSaved → {output_path}")
     if skipped:
         print(f"Skipped {len(skipped)} glyph(s): {', '.join(skipped)}")
+
+
+# ---------------------------------------------------------------------------
+# Debug helper
+# ---------------------------------------------------------------------------
+
+def _debug_glyph(font_path: str, glyph_name: str,
+                 lr_x_tolerance: int = 32, lr_y_tolerance: int = 32,
+                 tb_x_tolerance: int = 32, tb_y_tolerance: int = 32) -> None:
+    """
+    Print on-curve points, symmetry axis, and per-point mirror results for
+    a named glyph so that detection failures can be diagnosed.
+    """
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(font_path)
+    cmap_rev = {v: k for k, v in (font.getBestCmap() or {}).items()}
+    cp = cmap_rev.get(glyph_name)
+    print(f"Glyph     : {glyph_name}  (U+{cp:04X})" if cp else f"Glyph     : {glyph_name}  (not in cmap)")
+    print(f"Tolerances: LR x±{lr_x_tolerance} y±{lr_y_tolerance}   TB x±{tb_x_tolerance} y±{tb_y_tolerance}")
+
+    pts = _on_curve_points(font, glyph_name)
+    if not pts:
+        print("No on-curve points found.")
+        return
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    cx = (min(xs) + max(xs)) / 2
+    cy = (min(ys) + max(ys)) / 2
+    pt_set = {(round(x), round(y)) for x, y in pts}
+
+    def has_lr_mirror(mx, my):
+        return any(
+            (mx + dx, my + dy) in pt_set
+            for dx in range(-lr_x_tolerance, lr_x_tolerance + 1)
+            for dy in range(-lr_y_tolerance, lr_y_tolerance + 1)
+        )
+
+    def has_tb_mirror(mx, my):
+        return any(
+            (mx + dx, my + dy) in pt_set
+            for dx in range(-tb_x_tolerance, tb_x_tolerance + 1)
+            for dy in range(-tb_y_tolerance, tb_y_tolerance + 1)
+        )
+
+    print(f"Points    : {len(pts)}")
+    print(f"x range   : {min(xs):.0f} – {max(xs):.0f}   cx = {cx:.1f}")
+    print(f"y range   : {min(ys):.0f} – {max(ys):.0f}   cy = {cy:.1f}")
+    print()
+    print(f"{'#':>3}  {'x':>6}  {'y':>6}  {'LR mirror':>10}  LR✓  {'TB mirror':>10}  TB✓")
+    print("-" * 60)
+
+    lr_hits = 0
+    tb_hits = 0
+    for i, (x, y) in enumerate(pts):
+        lmx, lmy = round(2 * cx - x), round(y)
+        tmx, tmy = round(x), round(2 * cy - y)
+        lr_ok = has_lr_mirror(lmx, lmy)
+        tb_ok = has_tb_mirror(tmx, tmy)
+        lr_hits += lr_ok
+        tb_hits += tb_ok
+        print(f"{i:>3}  {x:>6.0f}  {y:>6.0f}  "
+              f"({lmx:>4},{lmy:>4})  {'✓' if lr_ok else '✗':>4}  "
+              f"({tmx:>4},{tmy:>4})  {'✓' if tb_ok else '✗':>4}")
+
+    n = len(pts)
+    print()
+    print(f"LR score  : {lr_hits}/{n} = {lr_hits/n:.3f}")
+    print(f"TB score  : {tb_hits}/{n} = {tb_hits/n:.3f}")
+
+    try:
+        g = font["glyf"][glyph_name]
+        g.recalcBounds(font["glyf"])
+        print(f"glyf bbox : xMin={g.xMin} xMax={g.xMax} yMin={g.yMin} yMax={g.yMax}")
+        print(f"bbox cx   : {(g.xMin+g.xMax)/2:.1f}  (vs on-curve cx={cx:.1f})")
+    except Exception:
+        pass
+
+    # ---- Bitmap visualisation -----------------------------------------------
+    cmap_fwd = font.getBestCmap() or {}
+    cp_code = cmap_rev.get(glyph_name)
+    if cp_code is None:
+        return
+
+    from fontTools.ttLib import TTFont as _TTFont
+    face = load_face(font_path, 16)   # use grid=16 for debug
+    scale = font["head"].unitsPerEm / 16
+
+    lr, tb, cx2, cy2, _, _ = detect_symmetry(font, glyph_name)
+
+    try:
+        g2 = font["glyf"][glyph_name]
+        g2.recalcBounds(font["glyf"])
+        xMin2 = g2.xMin
+        yMin2 = g2.yMin
+        xMax2 = g2.xMax
+        yMax2 = g2.yMax
+    except Exception:
+        xMin2 = xMax2 = yMin2 = yMax2 = 0
+
+    if not lr:
+        cx2 = (xMin2 + xMax2) / 2
+    if not tb:
+        cy2 = (yMin2 + yMax2) / 2
+
+    dx26 = alignment_shift_26dot6(cx2, xMin2, scale)
+    dy26 = alignment_shift_26dot6(cy2, yMin2, scale)
+
+    raw_grid, _, bm_left, bm_top = rasterise(face, cp_code, 96, dx26, dy26)
+    if raw_grid.size == 0:
+        print("\n(blank bitmap)")
+        return
+
+    lr_axis = None
+    tb_axis = None
+
+    enforced = raw_grid.copy()
+    if lr:
+        enforced = enforce_lr_symmetry(enforced)
+    if tb:
+        enforced = enforce_tb_symmetry(enforced)
+
+    def _render(grid, axis_col=None, axis_row=None):
+        rows2, cols2 = grid.shape
+        lines = []
+        for r in range(rows2):
+            row_str = ""
+            for c in range(cols2):
+                row_str += "█" if grid[r, c] else "·"
+            lines.append(row_str)
+        # mark axis position in header
+        header = " " * int(axis_col) + "|" if axis_col is not None else ""
+        return header, lines
+
+    lr_axis_str = f"{lr_axis:.2f}" if lr_axis is not None else "n/a"
+    tb_axis_str = f"{tb_axis:.2f}" if tb_axis is not None else "n/a"
+    print(f"\nBitmap  {raw_grid.shape[1]}×{raw_grid.shape[0]}px"
+          f"  bm_left={bm_left}  bm_top={bm_top}"
+          f"  lr_axis={lr_axis_str}  tb_axis={tb_axis_str}")
+
+    rows2, cols2 = raw_grid.shape
+    ax_col_i = int(round(lr_axis)) if lr_axis is not None else None
+    # print side-by-side: before | after
+    header_nums = "".join(str(c % 10) for c in range(cols2))
+    print(f"  col:  {header_nums}    col:  {header_nums}")
+    print(f"  {'before':^{cols2}}    {'after (enforced)':^{cols2}}")
+    for r in range(rows2):
+        b_row = "".join("█" if raw_grid[r, c]  else "·" for c in range(cols2))
+        a_row = "".join("█" if enforced[r, c] else "·" for c in range(cols2))
+        diff = "←" if (enforced[r] != raw_grid[r]).any() else " "
+        print(f"  {b_row}    {a_row} {diff}")
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +812,10 @@ def main():
     print(f"Threshold : {args.threshold}/255")
     print(f"Output    : {out}")
     print()
+
+    if args.debug_glyph:
+        _debug_glyph(str(inp), args.debug_glyph)
+        return
 
     convert(str(inp), args.grid, str(out), args.threshold)
 
