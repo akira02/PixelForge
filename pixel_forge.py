@@ -586,7 +586,16 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
     is_otf = "CFF " in font or "CFF2" in font
     if is_otf:
         from fontTools.pens.t2CharStringPen import T2CharStringPen
-        cff_charstrings = font["CFF "].cff.topDictIndex[0].CharStrings
+        cff_top = font["CFF "].cff.topDictIndex[0]
+        cff_charstrings = cff_top.CharStrings
+        # CID-keyed fonts store Private per-FD; simple CFF has one Private.
+        _cid_keyed = hasattr(cff_top, 'FDArray') and cff_top.FDArray
+        if _cid_keyed:
+            _glyph_to_idx = font.getReverseGlyphMap()
+            _fdarray  = cff_top.FDArray
+            _fdselect = cff_top.FDSelect
+        else:
+            _simple_private = getattr(cff_top, 'Private', None)
     else:
         from fontTools.pens.ttGlyphPen import TTGlyphPen
         glyf = font["glyf"]
@@ -681,12 +690,17 @@ def convert(input_path: str, grid_size: int, output_path: str, threshold: int = 
 
         if is_otf:
             try:
-                # Reuse the existing charstring's private dict (handles both
-                # simple and CID-keyed fonts where Private is per-FD).
-                existing_private = getattr(cff_charstrings.get(glyph_name), 'private', None)
+                if _cid_keyed:
+                    try:
+                        fd_idx = _fdselect[_glyph_to_idx[glyph_name]]
+                        cs_private = _fdarray[fd_idx].Private
+                    except Exception:
+                        cs_private = None
+                else:
+                    cs_private = _simple_private
                 pen = T2CharStringPen(snapped_adv, None)
                 draw_contours(scaled, pen)
-                cff_charstrings[glyph_name] = pen.getCharString(private=existing_private)
+                cff_charstrings[glyph_name] = pen.getCharString(private=cs_private)
             except Exception as e:
                 print(f"  [{done}/{total}] {glyph_name} U+{cp:04X}  SKIP (glyph build error: {e})")
                 skipped.append(glyph_name)
